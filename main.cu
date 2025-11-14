@@ -25,6 +25,11 @@
         } \
     } while(0)
 
+enum RasterMode {
+    MODE_FAST = 0,
+    MODE_QUALITY = 1
+};
+
 struct Vec3 {
     double x, y, z;
 };
@@ -363,8 +368,8 @@ __device__ void getTexColor(const unsigned char* textures, int texOffset, int te
     b = textures[idx + 2];
 }
 
-__device__ void drawLine3D(unsigned int* voxels, int* blockIds, int w, int h, int l,
-                          Vec3i p1, Vec3i p2, int blockId) {
+__device__ void drawLine3DBresenham(unsigned int* voxels, int* blockIds, int w, int h, int l,
+                                    Vec3i p1, Vec3i p2, int blockId) {
     int dx = abs(p2.x - p1.x);
     int dy = abs(p2.y - p1.y);
     int dz = abs(p2.z - p1.z);
@@ -400,11 +405,67 @@ __device__ void drawLine3D(unsigned int* voxels, int* blockIds, int w, int h, in
     }
 }
 
+__device__ void voxelizeTriangleConservative(unsigned int* voxels, int* blockIds, 
+                                             int w, int h, int l,
+                                             Vec3i v0, Vec3i v1, Vec3i v2, int blockId) {
+    int minX = min(v0.x, min(v1.x, v2.x));
+    int maxX = max(v0.x, max(v1.x, v2.x));
+    int minY = min(v0.y, min(v1.y, v2.y));
+    int maxY = max(v0.y, max(v1.y, v2.y));
+    int minZ = min(v0.z, min(v1.z, v2.z));
+    int maxZ = max(v0.z, max(v1.z, v2.z));
+    
+    for (int z = minZ; z <= maxZ; z++) {
+        for (int y = minY; y <= maxY; y++) {
+            for (int x = minX; x <= maxX; x++) {
+                if (x < 0 || x >= w || y < 0 || y >= h || z < 0 || z >= l) continue;
+                
+                float px = x + 0.5f, py = y + 0.5f, pz = z + 0.5f;
+                
+                float d0x = v1.x - v0.x, d0y = v1.y - v0.y, d0z = v1.z - v0.z;
+                float d1x = v2.x - v1.x, d1y = v2.y - v1.y, d1z = v2.z - v1.z;
+                float d2x = v0.x - v2.x, d2y = v0.y - v2.y, d2z = v0.z - v2.z;
+                
+                float nx = d0y * d1z - d0z * d1y;
+                float ny = d0z * d1x - d0x * d1z;
+                float nz = d0x * d1y - d0y * d1x;
+                
+                float t0x = px - v0.x, t0y = py - v0.y, t0z = pz - v0.z;
+                float t1x = px - v1.x, t1y = py - v1.y, t1z = pz - v1.z;
+                float t2x = px - v2.x, t2y = py - v2.y, t2z = pz - v2.z;
+                
+                float c0x = d0y * t0z - d0z * t0y;
+                float c0y = d0z * t0x - d0x * t0z;
+                float c0z = d0x * t0y - d0y * t0x;
+                float dot0 = c0x * nx + c0y * ny + c0z * nz;
+                
+                float c1x = d1y * t1z - d1z * t1y;
+                float c1y = d1z * t1x - d1x * t1z;
+                float c1z = d1x * t1y - d1y * t1x;
+                float dot1 = c1x * nx + c1y * ny + c1z * nz;
+                
+                float c2x = d2y * t2z - d2z * t2y;
+                float c2y = d2z * t2x - d2x * t2z;
+                float c2z = d2x * t2y - d2y * t2x;
+                float dot2 = c2x * nx + c2y * ny + c2z * nz;
+                
+                if ((dot0 >= -0.866f && dot1 >= -0.866f && dot2 >= -0.866f) ||
+                    (dot0 <= 0.866f && dot1 <= 0.866f && dot2 <= 0.866f)) {
+                    int idx = x + z * w + y * w * l;
+                    atomicOr(&voxels[idx], 1);
+                    atomicMax(&blockIds[idx], blockId);
+                }
+            }
+        }
+    }
+}
+
 __device__ void rasterizeTriangle(unsigned int* voxels, int* blockIds, int w, int h, int l,
                                  Vec3i v1, Vec3i v2, Vec3i v3,
                                  double u1, double v1t, double u2, double v2t, double u3, double v3t,
                                  const unsigned char* textures, int texOffset, int texW, int texH,
-                                 const Color* blockColors, const int* blockPaletteIds, int numBlocks) {
+                                 const Color* blockColors, const int* blockPaletteIds, int numBlocks,
+                                 int mode) {
     
     unsigned char r1, g1, b1, r2, g2, b2, r3, g3, b3;
     getTexColor(textures, texOffset, texW, texH, u1, v1t, r1, g1, b1);
@@ -418,53 +479,57 @@ __device__ void rasterizeTriangle(unsigned int* voxels, int* blockIds, int w, in
     int blockIdx = findBestBlock(avgR, avgG, avgB, blockColors, numBlocks);
     int blockId = blockPaletteIds[blockIdx];
 
-    drawLine3D(voxels, blockIds, w, h, l, v1, v2, blockId);
-    drawLine3D(voxels, blockIds, w, h, l, v2, v3, blockId);
-    drawLine3D(voxels, blockIds, w, h, l, v3, v1, blockId);
+    if (mode == MODE_QUALITY) {
+        voxelizeTriangleConservative(voxels, blockIds, w, h, l, v1, v2, v3, blockId);
+    } else {
+        drawLine3DBresenham(voxels, blockIds, w, h, l, v1, v2, blockId);
+        drawLine3DBresenham(voxels, blockIds, w, h, l, v2, v3, blockId);
+        drawLine3DBresenham(voxels, blockIds, w, h, l, v3, v1, blockId);
 
-    if (v1.y > v2.y) {
-        Vec3i tv = v1; v1 = v2; v2 = tv;
-        double tu = u1; u1 = u2; u2 = tu;
-        double tvt = v1t; v1t = v2t; v2t = tvt;
-    }
-    if (v2.y > v3.y) {
-        Vec3i tv = v2; v2 = v3; v3 = tv;
-        double tu = u2; u2 = u3; u3 = tu;
-        double tvt = v2t; v2t = v3t; v3t = tvt;
-    }
-    if (v1.y > v2.y) {
-        Vec3i tv = v1; v1 = v2; v2 = tv;
-        double tu = u1; u1 = u2; u2 = tu;
-        double tvt = v1t; v1t = v2t; v2t = tvt;
-    }
+        if (v1.y > v2.y) {
+            Vec3i tv = v1; v1 = v2; v2 = tv;
+            double tu = u1; u1 = u2; u2 = tu;
+            double tvt = v1t; v1t = v2t; v2t = tvt;
+        }
+        if (v2.y > v3.y) {
+            Vec3i tv = v2; v2 = v3; v3 = tv;
+            double tu = u2; u2 = u3; u3 = tu;
+            double tvt = v2t; v2t = v3t; v3t = tvt;
+        }
+        if (v1.y > v2.y) {
+            Vec3i tv = v1; v1 = v2; v2 = tv;
+            double tu = u1; u1 = u2; u2 = tu;
+            double tvt = v1t; v1t = v2t; v2t = tvt;
+        }
 
-    for (int y = v1.y; y <= v3.y; y++) {
-        Vec3i intersections[3];
-        int count = 0;
+        for (int y = v1.y; y <= v3.y; y++) {
+            Vec3i intersections[3];
+            int count = 0;
 
-        auto addIntersection = [&](Vec3i a, Vec3i b, int cy) {
-            if (a.y == b.y) return;
-            if ((a.y <= cy && cy < b.y) || (b.y <= cy && cy < a.y)) {
-                double t = (double)(cy - a.y) / (b.y - a.y);
-                int x = a.x + t * (b.x - a.x);
-                int z = a.z + t * (b.z - a.z);
-                if (count < 3) {
-                    intersections[count++] = {x, cy, z};
+            auto addIntersection = [&](Vec3i a, Vec3i b, int cy) {
+                if (a.y == b.y) return;
+                if ((a.y <= cy && cy < b.y) || (b.y <= cy && cy < a.y)) {
+                    double t = (double)(cy - a.y) / (b.y - a.y);
+                    int x = a.x + t * (b.x - a.x);
+                    int z = a.z + t * (b.z - a.z);
+                    if (count < 3) {
+                        intersections[count++] = {x, cy, z};
+                    }
                 }
+            };
+
+            addIntersection(v1, v2, y);
+            addIntersection(v2, v3, y);
+            addIntersection(v3, v1, y);
+
+            if (count > 1) {
+                 if (intersections[0].x > intersections[1].x) {
+                     Vec3i temp = intersections[0];
+                     intersections[0] = intersections[1];
+                     intersections[1] = temp;
+                 }
+                 drawLine3DBresenham(voxels, blockIds, w, h, l, intersections[0], intersections[1], blockId);
             }
-        };
-
-        addIntersection(v1, v2, y);
-        addIntersection(v2, v3, y);
-        addIntersection(v3, v1, y);
-
-        if (count > 1) {
-             if (intersections[0].x > intersections[1].x) {
-                 Vec3i temp = intersections[0];
-                 intersections[0] = intersections[1];
-                 intersections[1] = temp;
-             }
-             drawLine3D(voxels, blockIds, w, h, l, intersections[0], intersections[1], blockId);
         }
     }
 }
@@ -474,7 +539,8 @@ __global__ void rasterizeFaces(const Vec3i* vertices, const Vec2* texCoords, con
                               int w, int h, int l,
                               const unsigned char* textures, const int* texOffsets,
                               const int* texWidths, const int* texHeights,
-                              const Color* blockColors, const int* blockPaletteIds, int numBlocks) {
+                              const Color* blockColors, const int* blockPaletteIds, int numBlocks,
+                              int mode) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numFaces) return;
 
@@ -508,7 +574,7 @@ __global__ void rasterizeFaces(const Vec3i* vertices, const Vec2* texCoords, con
     rasterizeTriangle(voxels, blockIds, w, h, l, v1, v2, v3,
                      u1, vt1, u2, vt2, u3, vt3,
                      textures, texOffset, texW, texH,
-                     blockColors, blockPaletteIds, numBlocks);
+                     blockColors, blockPaletteIds, numBlocks, mode);
 }
 
 void writeShort(std::vector<uint8_t>& buf, uint16_t val) {
@@ -536,7 +602,7 @@ void writeVarint(std::vector<uint8_t>& buf, int val) {
     }
     buf.push_back(uval & 0x7F);
 }
-//Sponge V3 see https://github.com/SpongePowered/Schematic-Specification/blob/master/versions/schematic-3.md
+
 void writeSchematic(const std::string& file, const std::vector<std::vector<std::vector<int>>>& blocks_data,
                    int w, int h, int l, const std::vector<BlockTexture>& blockTextures) {
     std::vector<uint8_t> nbt;
@@ -618,7 +684,7 @@ void writeSchematic(const std::string& file, const std::vector<std::vector<std::
 }
 
 void convert(const OBJ& obj, const std::string& output, int target, 
-            const std::vector<BlockTexture>& blockTextures) {
+            const std::vector<BlockTexture>& blockTextures, RasterMode mode) {
     double sizeX = obj.maxX - obj.minX;
     double sizeY = obj.maxY - obj.minY;
     double sizeZ = obj.maxZ - obj.minZ;
@@ -630,6 +696,7 @@ void convert(const OBJ& obj, const std::string& output, int target,
     int l = (int)(sizeZ * scale) + 1;
 
     std::cout << "Dimensions: " << w << "x" << h << "x" << l << std::endl;
+    std::cout << "Mode: " << (mode == MODE_FAST ? "fast (Bresenham)" : "quality (conservative)") << std::endl;
 
     std::vector<Vec3i> vertices(obj.verts.size());
     for (size_t i = 0; i < obj.verts.size(); i++) {
@@ -741,7 +808,7 @@ void convert(const OBJ& obj, const std::string& output, int target,
         d_vertices, d_texCoords, d_faces, obj.faces.size(),
         d_voxels, d_blockIds, w, h, l,
         d_textures, d_texOffsets, d_texWidths, d_texHeights,
-        d_blockColors, d_blockPaletteIds, blockTextures.size()
+        d_blockColors, d_blockPaletteIds, blockTextures.size(), mode
     );
 
     cudaEventRecord(stop);
@@ -791,7 +858,9 @@ void convert(const OBJ& obj, const std::string& output, int target,
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cout << "Usage: " << argv[0] << " <input.obj> <output.schem> [scale] [textures_dir]" << std::endl;
+        std::cout << "Usage: " << argv[0] << " <input.obj> <output.schem> [scale] [textures_dir] [mode]" << std::endl;
+        std::cout << "  mode: fast (default, Bresenham wireframe+scanline)" << std::endl;
+        std::cout << "        quality (conservative rasterization)" << std::endl;
         return 1;
     }
 
@@ -799,6 +868,19 @@ int main(int argc, char** argv) {
     std::string output = argv[2];
     int target = argc > 3 ? std::stoi(argv[3]) : 100;
     std::string texturesDir = argc > 4 ? argv[4] : "textures";
+    
+    RasterMode mode = MODE_FAST;
+    if (argc > 5) {
+        std::string modeStr = argv[5];
+        if (modeStr == "quality") {
+            mode = MODE_QUALITY;
+        } else if (modeStr == "fast") {
+            mode = MODE_FAST;
+        } else {
+            std::cerr << "Invalid mode: " << modeStr << " (use 'fast' or 'quality')" << std::endl;
+            return 1;
+        }
+    }
 
     std::cout << "Loading block textures..." << std::endl;
     std::vector<BlockTexture> blockTextures = loadBlockTextures(texturesDir);
@@ -812,7 +894,7 @@ int main(int argc, char** argv) {
     OBJ obj = loadOBJ(input);
 
     std::cout << "Converting with texture mapping..." << std::endl;
-    convert(obj, output, target, blockTextures);
+    convert(obj, output, target, blockTextures, mode);
 
     std::cout << "Saved: " << output << std::endl;
     return 0;
